@@ -1,4 +1,10 @@
 # ignore these project-related files/directories -- these should not be committed.
+data/
+model/
+*.h5
+*.keras
+*.zip
+*.csv
 model
 train.csv
 dev.csv
