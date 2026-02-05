@@ -1,0 +1,245 @@
+import argparse
+import numpy as np
+import pandas as pd
+import datasets
+import transformers
+import tensorflow as tf
+from sklearn.metrics import f1_score
+
+
+def train_model(
+    save_model_path="model.keras",
+    save_transformer_dir="transformer_model",
+    train_file="train.csv",
+    valid_file="dev.csv",
+    test_file="test.csv",
+    batch_size=32,
+    learning_rate=2e-5,
+    epochs=10,
+    dropout=0.4,
+    dense_layers=[1024, 512, 256, 128],
+    label_smooth=0.01,
+    max_len=128,
+    thresholds=None,
+):
+    # Initialize tokenizer and base transformer model
+    tokenizer = transformers.AutoTokenizer.from_pretrained("distilroberta-base")
+    base_model = transformers.TFAutoModel.from_pretrained("distilroberta-base")
+
+    # Load CSV files into an HF dataset
+    dataset = datasets.load_dataset(
+        "csv", data_files={"train": train_file, "validation": valid_file}
+    )
+    labels = dataset["train"].column_names[1:]
+    print("Detected labels:", labels)
+
+    # Map each example to its floating-point label list
+    def extract_labels(ex):
+        return {"labels": [float(ex[l]) for l in labels]}
+
+    dataset = dataset.map(extract_labels)
+
+    # Tokenize text batches
+    def tokenize_batch(batch):
+        return tokenizer(
+            batch["text"], truncation=True, padding="max_length", max_length=max_len
+        )
+
+    dataset = dataset.map(tokenize_batch, batched=True)
+
+    # Convert to TensorFlow-friendly format
+    def to_tf_format(item):
+        return {
+            "input_ids": item["input_ids"],
+            "attention_mask": item["attention_mask"],
+            "labels": item["labels"],
+        }
+
+    tf_train = dataset["train"].map(to_tf_format).with_format(
+        "tensorflow", columns=["input_ids", "attention_mask", "labels"]
+    )
+    tf_valid = dataset["validation"].map(to_tf_format).with_format(
+        "tensorflow", columns=["input_ids", "attention_mask", "labels"]
+    )
+
+    train_tf = tf_train.to_tf_dataset(
+        columns=["input_ids", "attention_mask"],
+        label_cols="labels",
+        batch_size=batch_size,
+        shuffle=True,
+    )
+    valid_tf = tf_valid.to_tf_dataset(
+        columns=["input_ids", "attention_mask"],
+        label_cols="labels",
+        batch_size=batch_size,
+    )
+
+    # Build classification head on top of transformer outputs
+    in_ids = tf.keras.Input(shape=(max_len,), dtype=tf.int32, name="input_ids")
+    att_mask = tf.keras.Input(
+        shape=(max_len,), dtype=tf.int32, name="attention_mask"
+    )
+    seq_output = base_model(in_ids, attention_mask=att_mask)[0]
+
+    avg_pool = tf.keras.layers.GlobalAveragePooling1D()(seq_output)
+    max_pool = tf.keras.layers.GlobalMaxPooling1D()(seq_output)
+    x = tf.keras.layers.Concatenate()([avg_pool, max_pool])
+
+    # Add fully connected layers with dropout
+    for units in dense_layers:
+        x = tf.keras.layers.Dense(units, activation="relu")(x)
+        x = tf.keras.layers.Dropout(dropout)(x)
+
+    logits = tf.keras.layers.Dense(len(labels), activation="sigmoid")(x)
+    model = tf.keras.Model(inputs=[in_ids, att_mask], outputs=logits)
+
+    # Compile model with binary crossentropy and track micro-F1 via AUC metric
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+        loss=tf.keras.losses.BinaryCrossentropy(label_smoothing=label_smooth),
+        metrics=[
+            tf.keras.metrics.BinaryAccuracy(),
+            tf.keras.metrics.AUC(name="val_micro_F1", multi_label=True),
+        ],
+    )
+
+    # Callbacks for checkpointing and learning-rate adjustment
+    callbacks = [
+        tf.keras.callbacks.ModelCheckpoint(
+            save_model_path,
+            monitor="val_micro_F1",
+            mode="max",
+            save_best_only=True,
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.2, patience=2, min_lr=1e-6
+        ),
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_micro_F1", patience=3, mode="max", restore_best_weights=True
+        ),
+    ]
+
+    # Train the network
+    history = model.fit(
+        train_tf, validation_data=valid_tf, epochs=epochs, callbacks=callbacks
+    )
+
+    # Summarize training outcomes
+    print("Training complete!")
+    for idx in range(len(history.history["loss"])):
+        print(
+            f"Epoch {idx+1} - Loss: {history.history['loss'][idx]:.4f},"
+            f" Val Micro F1: {history.history['val_micro_F1'][idx]:.4f}"
+        )
+
+    # Compute per-class F1 on the validation set
+    all_true = np.vstack([b[1].numpy() for b in valid_tf])
+    preds = model.predict(valid_tf)
+    if thresholds is None:
+        thresholds = np.array([0.45, 0.45, 0.45, 0.45, 0.25, 0.25, 0.45])
+    pred_labels = (preds > thresholds).astype(int)
+    print("\nValidation F1 scores:")
+    for i, lab in enumerate(labels):
+        print(f"{lab}: {f1_score(all_true[:, i], pred_labels[:, i]):.4f}")
+
+    # Persist transformer and tokenizer
+    base_model.save_pretrained(save_transformer_dir)
+    tokenizer.save_pretrained(save_transformer_dir)
+
+
+def predict_model(
+    model_file="model.keras",
+    transformer_dir="transformer_model",
+    csv_input="dev.csv",
+    max_len=128,
+    dense_layers=[1024, 512, 256, 128],
+    dropout=0.4,
+    thresholds=None,
+):
+    # Load tokenizer and transformer
+    tokenizer = transformers.AutoTokenizer.from_pretrained(transformer_dir)
+    base_model = transformers.TFAutoModel.from_pretrained(transformer_dir)
+
+    # Read data and extract true labels
+    df = pd.read_csv(csv_input)
+    labels = df.columns[1:]
+    true_vals = df.iloc[:, 1:].values
+
+    # Tokenize input texts
+    ds = datasets.Dataset.from_pandas(df)
+    ds = ds.map(
+        lambda x: tokenizer(
+            x["text"], truncation=True, padding="max_length", max_length=max_len
+        ),
+        batched=True,
+    )
+    ds = ds.map(
+        lambda item: {"input_ids": item["input_ids"], "attention_mask": item["attention_mask"]}
+    ).with_format("tensorflow", columns=["input_ids", "attention_mask"]).
+        to_tf_dataset(columns=["input_ids", "attention_mask"], batch_size=32)
+
+    # Recreate the model architecture
+    in_ids = tf.keras.Input(shape=(max_len,), dtype=tf.int32, name="input_ids")
+    att_mask = tf.keras.Input(
+        shape=(max_len,), dtype=tf.int32, name="attention_mask"
+    )
+    seq_out = base_model(in_ids, attention_mask=att_mask)[0]
+    pooled_avg = tf.keras.layers.GlobalAveragePooling1D()(seq_out)
+    pooled_max = tf.keras.layers.GlobalMaxPooling1D()(seq_out)
+    x = tf.keras.layers.Concatenate()([pooled_avg, pooled_max])
+    for u in dense_layers:
+        x = tf.keras.layers.Dense(u, activation="relu")(x)
+        x = tf.keras.layers.Dropout(dropout)(x)
+    logits = tf.keras.layers.Dense(len(labels), activation="sigmoid")(x)
+    model = tf.keras.Model(inputs=[in_ids, att_mask], outputs=logits)
+
+    # Load trained weights
+    model.load_weights(model_file)
+
+    # Predict and binarize
+    probs = model.predict(ds)
+    if thresholds is None:
+        thresholds = np.array([0.45, 0.45, 0.45, 0.45, 0.25, 0.25, 0.45])
+    preds = (probs > thresholds).astype(int)
+
+    # Align shapes if needed
+    if true_vals.shape != preds.shape:
+        r = min(true_vals.shape[0], preds.shape[0])
+        c = min(true_vals.shape[1], preds.shape[1])
+        true_vals = true_vals[:r, :c]
+        preds = preds[:r, :c]
+
+    # Display micro and macro F1
+    print(f"Micro F1: {f1_score(true_vals, preds, average='micro'):.4f}")
+    print(f"Macro F1: {f1_score(true_vals, preds, average='macro'):.4f}")
+    print("\nPer-class F1:")
+    for i, lab in enumerate(labels[:true_vals.shape[1]]):
+        print(f"{lab}: {f1_score(true_vals[:, i], preds[:, i]):.4f}")
+
+    # Show sample predictions
+    for i in range(min(5, len(df))):
+        print(f"Text: {df['text'][i]}")
+        print(f"Pred: {preds[i]}, True: {true_vals[i]}")
+        print()
+
+    # Prepare submission
+    for i, lab in enumerate(labels[:preds.shape[1]]):
+        df[lab] = preds[:, i]
+    df.to_csv(
+        "submission.zip",
+        index=False,
+        compression={"method": "zip", "archive_name": "submission.csv"},
+    )
+    print("Submission archive written as 'submission.zip'.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Train or run predictions with emotion model"
+    )
+    parser.add_argument("mode", choices=["train", "predict"] )
+    args = parser.parse_args()
+    if args.mode == "train":
+        train_model()
+    else:
+        predict_model()
